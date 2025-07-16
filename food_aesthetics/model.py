@@ -6,6 +6,7 @@ from pathlib import Path
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Dense, Dropout
 from tensorflow.keras.applications.mobilenet import MobileNet
+import h5py
 
 
 class FoodAesthetics:
@@ -18,7 +19,55 @@ class FoodAesthetics:
         self.model = NimaMobileNet(training=False)
         self.model.build((self.__batch_size, 224, 224, 3))
         self.__home_path = Path(__file__).parent.resolve()
-        self.model.load_weights(self.__home_path/'trained_weights.h5')
+        self._load_weights_manually()
+
+    def _load_weights_manually(self):
+        """
+        Load weights manually to handle layer count mismatch.
+        """
+        import h5py
+        
+        # First, build the model by calling it with dummy data
+        dummy_input = tf.random.normal((1, 224, 224, 3))
+        self.model(dummy_input)
+        
+        weights_path = self.__home_path/'trained_weights.h5'
+        
+        with h5py.File(weights_path, 'r') as f:
+            # Load base model weights (MobileNet)
+            base_model_group = f['mobilenet_1.00_None']
+            for layer in self.model.base_model.layers:
+                if layer.name in base_model_group:
+                    layer_group = base_model_group[layer.name]
+                    weights = []
+                    for weight_name in layer.weights:
+                        weight_key = weight_name.name.split('/')[-1]
+                        if weight_key in layer_group:
+                            weights.append(layer_group[weight_key][:])
+                    if weights:
+                        layer.set_weights(weights)
+            
+            # Load dense layer weights
+            if 'model' in f and 'dense' in f['model']:
+                dense_group = f['model']['dense']
+                dense_weights = []
+                if 'kernel:0' in dense_group:
+                    dense_weights.append(dense_group['kernel:0'][:])
+                if 'bias:0' in dense_group:
+                    dense_weights.append(dense_group['bias:0'][:])
+                if dense_weights:
+                    self.model.dense1.set_weights(dense_weights)
+            
+            # Load final dense layer weights
+            if 'dense_1' in f and 'dense_1' in f['dense_1']:
+                final_dense_group = f['dense_1']['dense_1']
+                final_weights = []
+                if 'kernel:0' in final_dense_group:
+                    final_weights.append(final_dense_group['kernel:0'][:])
+                if 'bias:0' in final_dense_group:
+                    final_weights.append(final_dense_group['bias:0'][:])
+                if final_weights:
+                    self.model.dense2.set_weights(final_weights)
 
     def aesthetic_score(self, path):
         """
@@ -310,19 +359,13 @@ class NimaMobileNet(tf.keras.Model):
         self.training = training
         self.base_model = MobileNet((None, None, 3), alpha=1, include_top=False,
             pooling='avg', weights=None)
-        if self.training:
-            self.x = Dropout(0.25)(self.base_model.output)
-        else:
-            self.x = self.base_model.output
-        self.x = Dense(10, activation='relu')(self.x)
-        self.model = Model(self.base_model.input, self.x)
-
-        # Add New Layers
-        self.fc_last = Dense(2)
+        self.dense1 = Dense(10, activation='relu')
+        self.dense2 = Dense(2)
 
     def call(self, x):
-        x = self.model(x)
-        return self.fc_last(x)
+        x = self.base_model(x)
+        x = self.dense1(x)
+        return self.dense2(x)
 
 
 if __name__ == '__main__':
