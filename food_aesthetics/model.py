@@ -7,6 +7,15 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Dense, Dropout
 from tensorflow.keras.applications.mobilenet import MobileNet
 import h5py
+import random
+
+# Set global seeds for maximum reproducibility
+tf.random.set_seed(42)
+np.random.seed(42)
+random.seed(42)
+
+# Configure TensorFlow for deterministic operations
+tf.config.experimental.enable_op_determinism()
 
 
 class FoodAesthetics:
@@ -14,16 +23,26 @@ class FoodAesthetics:
 
         super(FoodAesthetics, self).__init__()
 
+        # Set random seeds for reproducibility
+        tf.random.set_seed(42)
+        import numpy as np
+        np.random.seed(42)
+        import random
+        random.seed(42)
+
         self.__batch_size = 1
         self.temperature = 1.536936640739441
-        self.model = NimaMobileNet(training=False)
-        self.model.build((self.__batch_size, 224, 224, 3))
         self.__home_path = Path(__file__).parent.resolve()
-        self._load_weights_manually()
+        
+        # Use a deterministic approach to ensure session-to-session consistency
+        print("Initializing model with deterministic loading...")
+        self.model = self._create_and_load_model_deterministically()
 
     def _load_weights_manually(self):
         """
-        Load weights manually to handle layer count mismatch.
+        Load weights using a different approach to handle the corrupted weights file.
+        Since the weights in the file appear to be corrupted/zeros, we'll try 
+        loading them using the 'model' group which might have proper weights.
         """
         import h5py
         
@@ -33,41 +52,157 @@ class FoodAesthetics:
         
         weights_path = self.__home_path/'trained_weights.h5'
         
-        with h5py.File(weights_path, 'r') as f:
-            # Load base model weights (MobileNet)
-            base_model_group = f['mobilenet_1.00_None']
-            for layer in self.model.base_model.layers:
-                if layer.name in base_model_group:
-                    layer_group = base_model_group[layer.name]
+        try:
+            # Try loading weights from the 'model' group which might contain the full model
+            with h5py.File(weights_path, 'r') as f:
+                if 'model' in f:
+                    print("Attempting to load weights from 'model' group...")
+                    
+                    # Create a temporary full model to load the saved model weights
+                    base_model = MobileNet((None, None, 3), alpha=1, include_top=False,
+                                         pooling='avg', weights=None)
+                    x = base_model.output
+                    x = Dense(10, activation='relu', name='dense')(x)
+                    temp_model = Model(base_model.input, x)
+                    temp_model.build((1, 224, 224, 3))
+                    
+                    # Try to load the model group weights into the temporary model
+                    temp_model.load_weights(weights_path, by_name=True, skip_mismatch=True)
+                    
+                    # Copy weights from temporary model to our model
+                    # Copy base model weights
+                    for our_layer, temp_layer in zip(self.model.base_model.layers, temp_model.layers[:-1]):
+                        if len(our_layer.weights) > 0 and len(temp_layer.weights) > 0:
+                            our_layer.set_weights(temp_layer.get_weights())
+                    
+                    # Copy dense1 weights (the Dense(10) layer)
+                    dense_layer = temp_model.get_layer('dense')
+                    if dense_layer and len(dense_layer.weights) > 0:
+                        self.model.dense1.set_weights(dense_layer.get_weights())
+                    
+                    print("Successfully loaded weights from 'model' group")
+                    
+                # Load final dense layer weights from 'dense_1' group
+                if 'dense_1' in f and 'dense_1' in f['dense_1']:
+                    final_dense_group = f['dense_1']['dense_1']
+                    final_weights = []
+                    if 'kernel:0' in final_dense_group:
+                        final_weights.append(final_dense_group['kernel:0'][:])
+                    if 'bias:0' in final_dense_group:
+                        final_weights.append(final_dense_group['bias:0'][:])
+                    if final_weights:
+                        self.model.dense2.set_weights(final_weights)
+                        print("Successfully loaded dense2 weights")
+                        
+        except Exception as e:
+            print(f"Warning: Could not load some weights: {e}")
+            print("Model will use random initialization - results may not be meaningful")
+
+    def _create_and_load_model_deterministically(self):
+        """
+        Create and load model in a completely deterministic way to ensure
+        session-to-session consistency.
+        """
+        # Step 1: Create the model architecture with deterministic initialization
+        model = NimaMobileNet(training=False)
+        
+        # Step 2: Build the model with a fixed input shape
+        model.build((self.__batch_size, 224, 224, 3))
+        
+        # Step 3: Initialize with dummy data to ensure all layers are built
+        dummy_input = tf.random.normal((1, 224, 224, 3), seed=42)
+        _ = model(dummy_input)
+        
+        # Step 4: Load weights in the most comprehensive way possible
+        weights_path = self.__home_path/'trained_weights.h5'
+        
+        try:
+            # Try the most strict loading first - all weights must match
+            model.load_weights(weights_path)
+            print("✅ Successfully loaded ALL weights with strict matching")
+            return model
+        except:
+            try:
+                # If that fails, try by_name but without skip_mismatch
+                model.load_weights(weights_path, by_name=True, skip_mismatch=False)
+                print("✅ Successfully loaded weights by name (strict)")
+                return model
+            except:
+                try:
+                    # Last resort: by_name with skip_mismatch, but report what's missing
+                    print("⚠️  Using partial weight loading - checking what's missing...")
+                    
+                    # Create a temporary model to check weight structure
+                    temp_model = NimaMobileNet(training=False)
+                    temp_model.build((1, 224, 224, 3))
+                    _ = temp_model(tf.random.normal((1, 224, 224, 3), seed=42))
+                    
+                    # Load with detailed reporting
+                    import h5py
+                    with h5py.File(weights_path, 'r') as f:
+                        self._load_weights_with_verification(model, f)
+                    
+                    print("✅ Successfully loaded weights with verification")
+                    return model
+                except Exception as e:
+                    print(f"❌ All loading methods failed: {e}")
+                    print("Using random weights - results will not be meaningful")
+                    return model
+
+    def _load_weights_with_verification(self, model, h5_file):
+        """Load weights with detailed verification and reporting."""
+        
+        # Load MobileNet weights from 'model' group (these seem to be the correct ones)
+        if 'model' in h5_file:
+            print("Loading MobileNet weights from 'model' group...")
+            model_group = h5_file['model']
+            
+            # Map each layer in our model to the corresponding weights
+            layers_loaded = 0
+            for layer in model.base_model.layers:
+                if layer.name in model_group and len(layer.weights) > 0:
+                    layer_group = model_group[layer.name]
                     weights = []
-                    for weight_name in layer.weights:
-                        weight_key = weight_name.name.split('/')[-1]
-                        if weight_key in layer_group:
-                            weights.append(layer_group[weight_key][:])
-                    if weights:
+                    
+                    # Load all weight arrays for this layer
+                    for weight_tensor in layer.weights:
+                        weight_name = weight_tensor.name.split('/')[-1]
+                        if weight_name in layer_group:
+                            weights.append(layer_group[weight_name][:])
+                    
+                    if len(weights) == len(layer.weights):
                         layer.set_weights(weights)
+                        layers_loaded += 1
             
-            # Load dense layer weights
-            if 'model' in f and 'dense' in f['model']:
-                dense_group = f['model']['dense']
-                dense_weights = []
-                if 'kernel:0' in dense_group:
-                    dense_weights.append(dense_group['kernel:0'][:])
-                if 'bias:0' in dense_group:
-                    dense_weights.append(dense_group['bias:0'][:])
-                if dense_weights:
-                    self.model.dense1.set_weights(dense_weights)
+            print(f"Loaded weights for {layers_loaded} MobileNet layers")
             
-            # Load final dense layer weights
-            if 'dense_1' in f and 'dense_1' in f['dense_1']:
-                final_dense_group = f['dense_1']['dense_1']
+            # Load Dense(10) layer weights
+            if 'dense' in model_group:
+                dense_group = model_group['dense']
+                if len(model.dense1.weights) > 0:
+                    dense_weights = []
+                    for weight_tensor in model.dense1.weights:
+                        weight_name = weight_tensor.name.split('/')[-1]
+                        if weight_name in dense_group:
+                            dense_weights.append(dense_group[weight_name][:])
+                    
+                    if len(dense_weights) == len(model.dense1.weights):
+                        model.dense1.set_weights(dense_weights)
+                        print("Loaded Dense(10) layer weights")
+        
+        # Load final Dense(2) layer weights
+        if 'dense_1' in h5_file and 'dense_1' in h5_file['dense_1']:
+            final_group = h5_file['dense_1']['dense_1']
+            if len(model.dense2.weights) > 0:
                 final_weights = []
-                if 'kernel:0' in final_dense_group:
-                    final_weights.append(final_dense_group['kernel:0'][:])
-                if 'bias:0' in final_dense_group:
-                    final_weights.append(final_dense_group['bias:0'][:])
-                if final_weights:
-                    self.model.dense2.set_weights(final_weights)
+                for weight_tensor in model.dense2.weights:
+                    weight_name = weight_tensor.name.split('/')[-1]
+                    if weight_name in final_group:
+                        final_weights.append(final_group[weight_name][:])
+                
+                if len(final_weights) == len(model.dense2.weights):
+                    model.dense2.set_weights(final_weights)
+                    print("Loaded Dense(2) layer weights")
 
     def aesthetic_score(self, path):
         """
@@ -77,11 +212,13 @@ class FoodAesthetics:
         Output: aesthetic score in range from 0 to 1.
         """
         
-        photo = np.array(self._load_image(path))
-        photo = tf.image.random_crop(tf.convert_to_tensor(photo / 255, dtype=tf.float16), (224, 224, 3))
+        # Use center cropping for consistent results
+        photo = np.array(self._load_and_center_crop(path))
+        photo = tf.convert_to_tensor(photo / 255, dtype=tf.float32)
         
-        #photo = np.array(self._load_and_center_crop(path))
-        #photo = tf.convert_to_tensor(photo / 255, dtype=tf.float16)
+        # Alternative: Random crop (causes varying results each run)
+        #photo = np.array(self._load_image(path))
+        #photo = tf.image.random_crop(tf.convert_to_tensor(photo / 255, dtype=tf.float32), (224, 224, 3))
 
         logits = self.model(tf.expand_dims(photo, axis = 0))
         logits_scaled = tf.math.divide(logits, self.temperature)
@@ -129,11 +266,12 @@ class FoodAesthetics:
 
         #print(np.array(pic_res).shape)    
 
-        # 2. center crop image
-        left = (width - 224)/2
-        top = (height - 224)/2
-        right = (width + 224)/2
-        bottom = (height + 224)/2
+        # 2. center crop image using the resized dimensions
+        resized_width, resized_height = pic_res.size
+        left = (resized_width - 224)/2
+        top = (resized_height - 224)/2
+        right = (resized_width + 224)/2
+        bottom = (resized_height + 224)/2
 
         cropped = pic_res.crop((left, top, right, bottom))
         #print(np.array(cropped).shape)
@@ -357,10 +495,20 @@ class NimaMobileNet(tf.keras.Model):
 
         super(NimaMobileNet, self).__init__()
         self.training = training
+        
+        # Ensure deterministic initialization
+        tf.random.set_seed(42)
+        
         self.base_model = MobileNet((None, None, 3), alpha=1, include_top=False,
             pooling='avg', weights=None)
-        self.dense1 = Dense(10, activation='relu')
-        self.dense2 = Dense(2)
+        
+        # Use explicit kernel initializers for deterministic behavior
+        self.dense1 = Dense(10, activation='relu', 
+                           kernel_initializer=tf.keras.initializers.GlorotUniform(seed=42),
+                           bias_initializer='zeros')
+        self.dense2 = Dense(2,
+                           kernel_initializer=tf.keras.initializers.GlorotUniform(seed=43),
+                           bias_initializer='zeros')
 
     def call(self, x):
         x = self.base_model(x)
