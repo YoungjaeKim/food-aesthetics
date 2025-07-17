@@ -1,535 +1,519 @@
 import tensorflow as tf
 import numpy as np
 from PIL import Image
+import os
 import cv2 as cv
 from pathlib import Path
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Dense, Dropout
-from tensorflow.keras.applications.mobilenet import MobileNet
-import h5py
-import random
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, classification_report
+import pandas as pd
+from datetime import datetime
+import json
 
-# Set global seeds for maximum reproducibility
+# Set random seeds for reproducibility
 tf.random.set_seed(42)
 np.random.seed(42)
-random.seed(42)
 
-# Configure TensorFlow for deterministic operations
-tf.config.experimental.enable_op_determinism()
+class FoodAestheticsTrainer:
+    def __init__(self, image_size=(224, 224)):
+        """
+        Initialize the Food Aesthetics Trainer.
+        
+        Args:
+            image_size: Tuple of (width, height) for input images
+        """
+        self.image_size = image_size
+        self.model = None
+        self.history = None
+        self.training_info = {}
+        
+    def load_and_prepare_data(self, images_dir):
+        """
+        Load and prepare training data from images directory.
+        Expects images with 'good-' prefix for high aesthetic score (1)
+        and 'bad-' prefix for low aesthetic score (0).
+        
+        Args:
+            images_dir: Path to directory containing labeled images
+            
+        Returns:
+            Tuple of (images, labels, filenames)
+        """
+        print("Loading and preparing training data...")
+        
+        images_path = Path(images_dir)
+        images = []
+        labels = []
+        filenames = []
+        
+        # Get all image files
+        image_files = [f for f in os.listdir(images_path) 
+                      if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        
+        for filename in image_files:
+            if filename.startswith('good-'):
+                label = 1  # High aesthetic score
+            elif filename.startswith('bad-'):
+                label = 0  # Low aesthetic score
+            else:
+                continue  # Skip unlabeled images
+            
+            try:
+                # Load and preprocess image
+                img_path = images_path / filename
+                img = Image.open(img_path).convert('RGB')
+                img = img.resize(self.image_size)
+                img_array = np.array(img) / 255.0  # Normalize to [0, 1]
+                
+                images.append(img_array)
+                labels.append(label)
+                filenames.append(filename)
+                
+            except Exception as e:
+                print(f"Error loading {filename}: {e}")
+                continue
+        
+        images = np.array(images)
+        labels = np.array(labels)
+        
+        print(f"Loaded {len(images)} images:")
+        print(f"  - High aesthetic (good): {sum(labels)} images")
+        print(f"  - Low aesthetic (bad): {len(labels) - sum(labels)} images")
+        
+        return images, labels, filenames
+    
+    def create_model(self):
+        """
+        Create a CNN model for food aesthetics classification.
+        This is a beginner-friendly architecture.
+        
+        Returns:
+            Compiled Keras model
+        """
+        model = tf.keras.Sequential([
+            # First convolutional block
+            tf.keras.layers.Conv2D(32, (3, 3), activation='relu', 
+                                 input_shape=(*self.image_size, 3)),
+            tf.keras.layers.MaxPooling2D(2, 2),
+            tf.keras.layers.BatchNormalization(),
+            
+            # Second convolutional block
+            tf.keras.layers.Conv2D(64, (3, 3), activation='relu'),
+            tf.keras.layers.MaxPooling2D(2, 2),
+            tf.keras.layers.BatchNormalization(),
+            
+            # Third convolutional block
+            tf.keras.layers.Conv2D(128, (3, 3), activation='relu'),
+            tf.keras.layers.MaxPooling2D(2, 2),
+            tf.keras.layers.BatchNormalization(),
+            
+            # Fourth convolutional block
+            tf.keras.layers.Conv2D(256, (3, 3), activation='relu'),
+            tf.keras.layers.MaxPooling2D(2, 2),
+            tf.keras.layers.BatchNormalization(),
+            
+            # Flatten and dense layers
+            tf.keras.layers.Flatten(),
+            tf.keras.layers.Dropout(0.5),
+            tf.keras.layers.Dense(512, activation='relu'),
+            tf.keras.layers.Dropout(0.3),
+            tf.keras.layers.Dense(128, activation='relu'),
+            tf.keras.layers.Dropout(0.2),
+            
+            # Output layer (binary classification)
+            tf.keras.layers.Dense(1, activation='sigmoid')
+        ])
+        
+        # Compile the model
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+            loss='binary_crossentropy',
+            metrics=['accuracy', 'precision', 'recall']
+        )
+        
+        return model
+    
+    def create_data_augmentation(self):
+        """
+        Create data augmentation pipeline to improve model generalization.
+        
+        Returns:
+            tf.keras.Sequential data augmentation pipeline
+        """
+        return tf.keras.Sequential([
+            tf.keras.layers.RandomFlip("horizontal"),
+            tf.keras.layers.RandomRotation(0.1),
+            tf.keras.layers.RandomZoom(0.1),
+            tf.keras.layers.RandomContrast(0.1),
+            tf.keras.layers.RandomBrightness(0.1),
+        ])
+    
+    def train_model(self, images_dir, epochs=50, validation_split=0.2, 
+                   batch_size=32, use_augmentation=True):
+        """
+        Train the food aesthetics model.
+        
+        Args:
+            images_dir: Path to directory containing labeled images
+            epochs: Number of training epochs
+            validation_split: Fraction of data to use for validation
+            batch_size: Batch size for training
+            use_augmentation: Whether to use data augmentation
+        """
+        print("Starting model training...")
+        
+        # Load data
+        images, labels, filenames = self.load_and_prepare_data(images_dir)
+        
+        if len(images) == 0:
+            raise ValueError("No labeled images found! Make sure images have 'good-' or 'bad-' prefixes.")
+        
+        # Create model
+        self.model = self.create_model()
+        
+        # Print model summary
+        print("\nModel Architecture:")
+        self.model.summary()
+        
+        # Create data augmentation if requested
+        if use_augmentation:
+            data_augmentation = self.create_data_augmentation()
+            # Apply augmentation to training data
+            augmented_images = data_augmentation(images)
+            images = np.concatenate([images, augmented_images])
+            labels = np.concatenate([labels, labels])
+        
+        # Split data
+        total_samples = len(images)
+        indices = np.random.permutation(total_samples)
+        val_samples = int(total_samples * validation_split)
+        
+        val_indices = indices[:val_samples]
+        train_indices = indices[val_samples:]
+        
+        X_train, X_val = images[train_indices], images[val_indices]
+        y_train, y_val = labels[train_indices], labels[val_indices]
+        
+        print(f"\nDataset split:")
+        print(f"  - Training samples: {len(X_train)}")
+        print(f"  - Validation samples: {len(X_val)}")
+        
+        # Callbacks
+        callbacks = [
+            tf.keras.callbacks.EarlyStopping(
+                monitor='val_loss',
+                patience=10,
+                restore_best_weights=True
+            ),
+            tf.keras.callbacks.ReduceLROnPlateau(
+                monitor='val_loss',
+                factor=0.5,
+                patience=5,
+                min_lr=1e-7
+            )
+        ]
+        
+        # Train model
+        print("\nStarting training...")
+        self.history = self.model.fit(
+            X_train, y_train,
+            batch_size=batch_size,
+            epochs=epochs,
+            validation_data=(X_val, y_val),
+            callbacks=callbacks,
+            verbose=1
+        )
+        
+        # Store training info
+        self.training_info = {
+            'total_samples': total_samples,
+            'training_samples': len(X_train),
+            'validation_samples': len(X_val),
+            'epochs_trained': len(self.history.history['loss']),
+            'final_train_accuracy': self.history.history['accuracy'][-1],
+            'final_val_accuracy': self.history.history['val_accuracy'][-1],
+            'training_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        
+        print(f"\nTraining completed!")
+        print(f"Final training accuracy: {self.training_info['final_train_accuracy']:.3f}")
+        print(f"Final validation accuracy: {self.training_info['final_val_accuracy']:.3f}")
+        
+        # Evaluate on validation set
+        self.evaluate_model(X_val, y_val)
+        
+    def evaluate_model(self, X_test, y_test):
+        """
+        Evaluate the trained model and show detailed metrics.
+        
+        Args:
+            X_test: Test images
+            y_test: Test labels
+        """
+        if self.model is None:
+            raise ValueError("Model not trained yet. Call train_model() first.")
+        
+        print("\nEvaluating model...")
+        
+        # Make predictions
+        y_pred_prob = self.model.predict(X_test)
+        y_pred = (y_pred_prob > 0.5).astype(int).flatten()
+        
+        # Calculate metrics
+        accuracy = np.mean(y_pred == y_test)
+        
+        print(f"Test Accuracy: {accuracy:.3f}")
+        print(f"Test Loss: {self.model.evaluate(X_test, y_test, verbose=0)[0]:.3f}")
+        
+        # Confusion matrix
+        cm = confusion_matrix(y_test, y_pred)
+        print("\nConfusion Matrix:")
+        print(cm)
+        
+        # Classification report
+        print("\nClassification Report:")
+        print(classification_report(y_test, y_pred, 
+                                  target_names=['Bad Aesthetic', 'Good Aesthetic']))
+        
+    def plot_training_history(self):
+        """
+        Plot training history to visualize model performance.
+        """
+        if self.history is None:
+            raise ValueError("No training history available. Train the model first.")
+        
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        
+        # Accuracy plot
+        axes[0, 0].plot(self.history.history['accuracy'], label='Training Accuracy')
+        axes[0, 0].plot(self.history.history['val_accuracy'], label='Validation Accuracy')
+        axes[0, 0].set_title('Model Accuracy')
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('Accuracy')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True)
+        
+        # Loss plot
+        axes[0, 1].plot(self.history.history['loss'], label='Training Loss')
+        axes[0, 1].plot(self.history.history['val_loss'], label='Validation Loss')
+        axes[0, 1].set_title('Model Loss')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Loss')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True)
+        
+        # Precision plot
+        axes[1, 0].plot(self.history.history['precision'], label='Training Precision')
+        axes[1, 0].plot(self.history.history['val_precision'], label='Validation Precision')
+        axes[1, 0].set_title('Model Precision')
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('Precision')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True)
+        
+        # Recall plot
+        axes[1, 1].plot(self.history.history['recall'], label='Training Recall')
+        axes[1, 1].plot(self.history.history['val_recall'], label='Validation Recall')
+        axes[1, 1].set_title('Model Recall')
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('Recall')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True)
+        
+        plt.tight_layout()
+        plt.savefig('training_history.png', dpi=300, bbox_inches='tight')
+        plt.show()
+        
+    def save_model(self, model_path='food_aesthetics_model.h5'):
+        """
+        Save the trained model to disk.
+        
+        Args:
+            model_path: Path where to save the model
+        """
+        if self.model is None:
+            raise ValueError("No model to save. Train the model first.")
+        
+        self.model.save(model_path)
+        
+        # Save training info
+        info_path = model_path.replace('.h5', '_info.json')
+        with open(info_path, 'w') as f:
+            json.dump(self.training_info, f, indent=2)
+        
+        print(f"Model saved to: {model_path}")
+        print(f"Training info saved to: {info_path}")
+        
+    def load_model(self, model_path='food_aesthetics_model.h5'):
+        """
+        Load a trained model from disk.
+        
+        Args:
+            model_path: Path to the saved model
+        """
+        self.model = tf.keras.models.load_model(model_path)
+        
+        # Load training info if available
+        info_path = model_path.replace('.h5', '_info.json')
+        if os.path.exists(info_path):
+            with open(info_path, 'r') as f:
+                self.training_info = json.load(f)
+        
+        print(f"Model loaded from: {model_path}")
 
 
 class FoodAesthetics:
-    def __init__(self):
-
-        super(FoodAesthetics, self).__init__()
-
-        # Set random seeds for reproducibility
-        tf.random.set_seed(42)
-        import numpy as np
-        np.random.seed(42)
-        import random
-        random.seed(42)
-
-        self.__batch_size = 1
-        self.temperature = 1.536936640739441
-        self.__home_path = Path(__file__).parent.resolve()
-        
-        # Use a deterministic approach to ensure session-to-session consistency
-        print("Initializing model with deterministic loading...")
-        self.model = self._create_and_load_model_deterministically()
-
-    def _load_weights_manually(self):
+    """
+    Main class for food aesthetics inference.
+    This replaces the original complex model with a simpler, trained version.
+    """
+    def __init__(self, model_path='food_aesthetics_model.h5'):
         """
-        Load weights using a different approach to handle the corrupted weights file.
-        Since the weights in the file appear to be corrupted/zeros, we'll try 
-        loading them using the 'model' group which might have proper weights.
+        Initialize the Food Aesthetics scorer.
+        
+        Args:
+            model_path: Path to the trained model
         """
-        import h5py
+        self.image_size = (224, 224)
+        self.model = None
+        self.model_path = model_path
         
-        # First, build the model by calling it with dummy data
-        dummy_input = tf.random.normal((1, 224, 224, 3))
-        self.model(dummy_input)
-        
-        weights_path = self.__home_path/'trained_weights.h5'
-        
-        try:
-            # Try loading weights from the 'model' group which might contain the full model
-            with h5py.File(weights_path, 'r') as f:
-                if 'model' in f:
-                    print("Attempting to load weights from 'model' group...")
-                    
-                    # Create a temporary full model to load the saved model weights
-                    base_model = MobileNet((None, None, 3), alpha=1, include_top=False,
-                                         pooling='avg', weights=None)
-                    x = base_model.output
-                    x = Dense(10, activation='relu', name='dense')(x)
-                    temp_model = Model(base_model.input, x)
-                    temp_model.build((1, 224, 224, 3))
-                    
-                    # Try to load the model group weights into the temporary model
-                    temp_model.load_weights(weights_path, by_name=True, skip_mismatch=True)
-                    
-                    # Copy weights from temporary model to our model
-                    # Copy base model weights
-                    for our_layer, temp_layer in zip(self.model.base_model.layers, temp_model.layers[:-1]):
-                        if len(our_layer.weights) > 0 and len(temp_layer.weights) > 0:
-                            our_layer.set_weights(temp_layer.get_weights())
-                    
-                    # Copy dense1 weights (the Dense(10) layer)
-                    dense_layer = temp_model.get_layer('dense')
-                    if dense_layer and len(dense_layer.weights) > 0:
-                        self.model.dense1.set_weights(dense_layer.get_weights())
-                    
-                    print("Successfully loaded weights from 'model' group")
-                    
-                # Load final dense layer weights from 'dense_1' group
-                if 'dense_1' in f and 'dense_1' in f['dense_1']:
-                    final_dense_group = f['dense_1']['dense_1']
-                    final_weights = []
-                    if 'kernel:0' in final_dense_group:
-                        final_weights.append(final_dense_group['kernel:0'][:])
-                    if 'bias:0' in final_dense_group:
-                        final_weights.append(final_dense_group['bias:0'][:])
-                    if final_weights:
-                        self.model.dense2.set_weights(final_weights)
-                        print("Successfully loaded dense2 weights")
-                        
-        except Exception as e:
-            print(f"Warning: Could not load some weights: {e}")
-            print("Model will use random initialization - results may not be meaningful")
-
-    def _create_and_load_model_deterministically(self):
-        """
-        Create and load model in a completely deterministic way to ensure
-        session-to-session consistency.
-        """
-        # Step 1: Create the model architecture with deterministic initialization
-        model = NimaMobileNet(training=False)
-        
-        # Step 2: Build the model with a fixed input shape
-        model.build((self.__batch_size, 224, 224, 3))
-        
-        # Step 3: Initialize with dummy data to ensure all layers are built
-        dummy_input = tf.random.normal((1, 224, 224, 3), seed=42)
-        _ = model(dummy_input)
-        
-        # Step 4: Load weights in the most comprehensive way possible
-        weights_path = self.__home_path/'trained_weights.h5'
-        
-        try:
-            # Try the most strict loading first - all weights must match
-            model.load_weights(weights_path)
-            print("✅ Successfully loaded ALL weights with strict matching")
-            return model
-        except:
-            try:
-                # If that fails, try by_name but without skip_mismatch
-                model.load_weights(weights_path, by_name=True, skip_mismatch=False)
-                print("✅ Successfully loaded weights by name (strict)")
-                return model
-            except:
-                try:
-                    # Last resort: by_name with skip_mismatch, but report what's missing
-                    print("⚠️  Using partial weight loading - checking what's missing...")
-                    
-                    # Create a temporary model to check weight structure
-                    temp_model = NimaMobileNet(training=False)
-                    temp_model.build((1, 224, 224, 3))
-                    _ = temp_model(tf.random.normal((1, 224, 224, 3), seed=42))
-                    
-                    # Load with detailed reporting
-                    import h5py
-                    with h5py.File(weights_path, 'r') as f:
-                        self._load_weights_with_verification(model, f)
-                    
-                    print("✅ Successfully loaded weights with verification")
-                    return model
-                except Exception as e:
-                    print(f"❌ All loading methods failed: {e}")
-                    print("Using random weights - results will not be meaningful")
-                    return model
-
-    def _load_weights_with_verification(self, model, h5_file):
-        """Load weights with detailed verification and reporting."""
-        
-        # Load MobileNet weights from 'model' group (these seem to be the correct ones)
-        if 'model' in h5_file:
-            print("Loading MobileNet weights from 'model' group...")
-            model_group = h5_file['model']
-            
-            # Map each layer in our model to the corresponding weights
-            layers_loaded = 0
-            for layer in model.base_model.layers:
-                if layer.name in model_group and len(layer.weights) > 0:
-                    layer_group = model_group[layer.name]
-                    weights = []
-                    
-                    # Load all weight arrays for this layer
-                    for weight_tensor in layer.weights:
-                        weight_name = weight_tensor.name.split('/')[-1]
-                        if weight_name in layer_group:
-                            weights.append(layer_group[weight_name][:])
-                    
-                    if len(weights) == len(layer.weights):
-                        layer.set_weights(weights)
-                        layers_loaded += 1
-            
-            print(f"Loaded weights for {layers_loaded} MobileNet layers")
-            
-            # Load Dense(10) layer weights
-            if 'dense' in model_group:
-                dense_group = model_group['dense']
-                if len(model.dense1.weights) > 0:
-                    dense_weights = []
-                    for weight_tensor in model.dense1.weights:
-                        weight_name = weight_tensor.name.split('/')[-1]
-                        if weight_name in dense_group:
-                            dense_weights.append(dense_group[weight_name][:])
-                    
-                    if len(dense_weights) == len(model.dense1.weights):
-                        model.dense1.set_weights(dense_weights)
-                        print("Loaded Dense(10) layer weights")
-        
-        # Load final Dense(2) layer weights
-        if 'dense_1' in h5_file and 'dense_1' in h5_file['dense_1']:
-            final_group = h5_file['dense_1']['dense_1']
-            if len(model.dense2.weights) > 0:
-                final_weights = []
-                for weight_tensor in model.dense2.weights:
-                    weight_name = weight_tensor.name.split('/')[-1]
-                    if weight_name in final_group:
-                        final_weights.append(final_group[weight_name][:])
-                
-                if len(final_weights) == len(model.dense2.weights):
-                    model.dense2.set_weights(final_weights)
-                    print("Loaded Dense(2) layer weights")
-
-    def aesthetic_score(self, path):
-        """
-        Compute aestehtic score of an image.
-
-        Input: path of the image.
-        Output: aesthetic score in range from 0 to 1.
-        """
-        
-        # Use center cropping for consistent results
-        photo = np.array(self._load_and_center_crop(path))
-        photo = tf.convert_to_tensor(photo / 255, dtype=tf.float32)
-        
-        # Alternative: Random crop (causes varying results each run)
-        #photo = np.array(self._load_image(path))
-        #photo = tf.image.random_crop(tf.convert_to_tensor(photo / 255, dtype=tf.float32), (224, 224, 3))
-
-        logits = self.model(tf.expand_dims(photo, axis = 0))
-        logits_scaled = tf.math.divide(logits, self.temperature)
-        score = tf.nn.softmax(logits_scaled).numpy()[:, 1].item()
-        return score
-
-
-    def _load_image(self, path):
-        """"
-        Open and center crop picture mantaining aspect ratio.
-
-        Input: path of image.
-        Output: resized image. Shortest side: 224 pixels.
-        """
-        pic = Image.open(path)
-        #pic = io.imread(path)
-        width, height = pic.size
-        s = max(224/width, 224/height)
-
-        if width < height:
-            pic_res = pic.resize((224, round(s*height)))
+        # Try to load the model
+        if os.path.exists(model_path):
+            self.load_model(model_path)
         else:
-            pic_res = pic.resize((round(s*width), 224))
-
-        return pic_res
-
+            print(f"Warning: Model file '{model_path}' not found.")
+            print("Please train a model first using the FoodAestheticsTrainer class.")
+            print("Example: trainer = FoodAestheticsTrainer()")
+            print("         trainer.train_model('images/')")
+            print("         trainer.save_model()")
     
-    def _load_and_center_crop(self, path):
+    def load_model(self, model_path):
+        """Load the trained model."""
+        try:
+            self.model = tf.keras.models.load_model(model_path)
+            print(f"Model loaded successfully from: {model_path}")
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            self.model = None
+    
+    def _preprocess_image(self, image_path):
         """
-        Load, Resize, and Center Crop image.
+        Preprocess an image for prediction.
         
-        Input: image path.
-        Output: center cropped image.
+        Args:
+            image_path: Path to the image
+            
+        Returns:
+            Preprocessed image array
         """
-        pic = Image.open(path)
-        width, height = pic.size
-
-        # 1. resize image: shortest side is 224 pixels 
-        s = max(224/width, 224/height)
-
-        if width < height:
-            pic_res = pic.resize((224, round(s*height)))
-        else:
-            pic_res = pic.resize((round(s*width), 224))
-
-        #print(np.array(pic_res).shape)    
-
-        # 2. center crop image using the resized dimensions
-        resized_width, resized_height = pic_res.size
-        left = (resized_width - 224)/2
-        top = (resized_height - 224)/2
-        right = (resized_width + 224)/2
-        bottom = (resized_height + 224)/2
-
-        cropped = pic_res.crop((left, top, right, bottom))
-        #print(np.array(cropped).shape)
-
-        return cropped
-
-
-
-    def _image2hsv(self, pic):
-        """"
-        Convert image from RGB to HSV.
-
-        Input: image.
-        Output: HSV matrix w/ shape H x W x C, C = 3 for H, S, and V respectively.
+        img = Image.open(image_path).convert('RGB')
+        img = img.resize(self.image_size)
+        img_array = np.array(img) / 255.0
+        return np.expand_dims(img_array, axis=0)
+    
+    def aesthetic_score(self, image_path):
         """
-        return cv.cvtColor(np.float32(self._load_image(pic)), cv.COLOR_RGB2HSV)
-
-
+        Compute aesthetic score of an image.
+        
+        Args:
+            image_path: Path to the image
+            
+        Returns:
+            Aesthetic score between 0 and 1 (higher is better)
+        """
+        if self.model is None:
+            raise ValueError("No model loaded. Please train or load a model first.")
+        
+        # Preprocess image
+        processed_image = self._preprocess_image(image_path)
+        
+        # Make prediction
+        prediction = self.model.predict(processed_image, verbose=0)[0][0]
+        
+        return float(prediction)
+    
+    def predict_batch(self, image_paths):
+        """
+        Predict aesthetic scores for multiple images.
+        
+        Args:
+            image_paths: List of image paths
+            
+        Returns:
+            List of aesthetic scores
+        """
+        if self.model is None:
+            raise ValueError("No model loaded. Please train or load a model first.")
+        
+        scores = []
+        for image_path in image_paths:
+            try:
+                score = self.aesthetic_score(image_path)
+                scores.append(score)
+            except Exception as e:
+                print(f"Error processing {image_path}: {e}")
+                scores.append(0.0)
+        
+        return scores
+    
+    # Additional feature extraction methods (simplified versions)
     def brightness(self, path):
-        """
-        Cross Pixel Average of VALUE (2) dimension.
-
-        Input: H x W x C HSV image.
-        Output: brightness value range [0, 255].
-        """
-        image = self._image2hsv(path)
-        return image[:,:,2].mean()
-
+        """Calculate average brightness of an image."""
+        img = cv.imread(str(path))
+        if img is None:
+            return 0
+        hsv = cv.cvtColor(img, cv.COLOR_BGR2HSV)
+        return hsv[:, :, 2].mean()
+    
     def saturation(self, path):
-        """
-        Cross Pixel Average of SATURATION (1) dimension.
-
-        Input: H x W x C HSV image.
-        Output: saturation value range [0, 255].
-        """
-        image = self._image2hsv(path)
-        return image[:, :, 1].mean()
-
+        """Calculate average saturation of an image."""
+        img = cv.imread(str(path))
+        if img is None:
+            return 0
+        hsv = cv.cvtColor(img, cv.COLOR_BGR2HSV)
+        return hsv[:, :, 1].mean()
+    
     def contrast(self, path):
-        """
-        Cross Pixel Standard Deviation of VALUE(2) dimension.
-
-        Input: H x W x C HSV image.
-        Output: contrast value range [0, n].
-        """
-        image = self._image2hsv(path)
-        return image[:, :, 2].std()
-
-    def clarity(self, path, thresold = 0.7, scaler = 255):
-        """
-        Proportion of Normalized VALUE (2) pixels that exceed the thresold (0.7).
-
-        Input: H x W x C HSV image.
-        Output: clarity value range [0, 1].
-        """
-        image = self._image2hsv(path)
-        h, w, c = image.shape
-        return np.sum(image[:,:,2] / scaler > thresold) / (h * w)
-
-    def warm(self, path):
-        """"
-        Proporion of Warm Hue (<30, >110) pixels.
-
-        Input: H x W x C HSV image.
-        Output: warm value range [0, 1].
-        """
-        image = self._image2hsv(path)
-        h, w, c = image.shape
-        return np.sum((image[:, :, 0] < 30) | (image[:, :, 0] > 110)) / (h * w)
-
-    def colourfulness(self, path):
-        """
-        Follow Hasler and Suesstrunk (2003) to compute colourfoulness.
-
-        Input: H x W x C RGB image.
-        Output: colourfoluness score.
-        """
-        image = np.array(self._load_image(path))
-        R, G, B = image[:,:,0], image[:,:,1], image[:,:,2]
-        rg = R - G
-        yb = 0.5 * (R+G) - B
-        sigma = np.sqrt(np.square(np.std(rg)) + np.square(np.std(yb)))
-        mu = np.sqrt(np.square(np.mean(rg)) + np.square(np.mean(yb)))
-        c = sigma + 0.3 * mu # colourfoulness
-        return c
-
-    def _grabcut(self, path, n_iter = 10):
-        """"
-        Performs GrabCut according to:
-        https://docs.opencv.org/master/d8/d83/tutorial_py_grabcut.html
-
-        Input: image path.
-        Output: a binary FOREGROUND mask of dimension H x W
-                such that 1 = foreground, 0 = background.
-        """
-        image = np.array(self._load_image(path))
-        mask = np.zeros(image.shape[:2],np.uint8) # mask of shape of the image
-        bgdModel = np.zeros((1,65),np.float64) # take as given by docs
-        fgdModel = np.zeros((1,65),np.float64) # take as given by docs
-
-        # see description later
-        rect = (1,1,image.shape[0]-1, image.shape[1]-1)
-        # starts at coordinates 0,0 and init a rectangle of size -1 w/ respect both to
-        # width and to height
-        cv.grabCut(image ,mask,rect, bgdModel, fgdModel, n_iter, cv.GC_INIT_WITH_RECT)
-        return np.where((mask==2)|(mask==0),0,1).astype('uint8')
+        """Calculate contrast (standard deviation of brightness)."""
+        img = cv.imread(str(path))
+        if img is None:
+            return 0
+        hsv = cv.cvtColor(img, cv.COLOR_BGR2HSV)
+        return hsv[:, :, 2].std()
 
 
-    def size_difference(self, path):
-        """
-        Computes Size Difference between Foreground and Background.
-
-        Input: image path.
-        Output: normalized size difference score.
-        """
-
-        mask = self._grabcut(path)
-        h, w = mask.shape
-        counts = np.unique(mask, return_counts=True)
-
-        #{counts[0][0]:counts[1][0], counts[0][1]:counts[1][1]}
-        # 1 foreground, 0 background
-        n_for = counts[1][1]
-        n_back = counts[1][0]
-        return (n_for - n_back) / (h * w)
-
-
-    def color_difference(self, path):
-        """
-        Computes the Euclidean distance between each RGB channel of Foreground
-        compared to Background.
-
-        Input: image path.
-        Output: Normed Euclidean distance score across each channel.
-        """
-
-        image = image = np.array(self._load_image(path))
-        mask = self._grabcut(path)
-
-        # compute front
-        front = image*mask[:,:,np.newaxis]
-
-        # compute back
-        back_mask = np.where(mask == 1, 0, 1) # jsut flip the original mask to detect the front
-        back = image * back_mask[:,:, np.newaxis]
-
-        # R, G, B
-        r_front, g_front, b_front = front[:,:,0].flatten(), front[:,:,1].flatten(), front[:,:,2].flatten()
-        r_back, g_back, b_back = back[:,:,0].flatten(), back[:,:,1].flatten(), back[:,:,2].flatten()
-
-        # create vectors (front and back) containing the average value for each channel - exclude the 0s from both front and back
-        avg_front = np.array([r_front[r_front != 0].mean(), g_front[g_front != 0].mean(), b_front[b_front != 0].mean()])
-        avg_back = np.array([r_back[r_back != 0].mean(), g_back[g_back != 0].mean(), b_back[b_back != 0].mean()])
-
-        return np.linalg.norm(avg_front - avg_back)
-
-
-    def texture_difference(self, path):
-        """
-        Compute texture differences between front edges and back edges.
-
-        Input: image path.
-        Output: absolute value of normalized front and back edge texture difference.
-        """
-
-        # input
-        image = image = np.array(self._load_image(path))
-        mask = self._grabcut(path)
-
-        # compute front
-        front = image*mask[:,:,np.newaxis]
-        front_flattened = front.flatten()
-        front_shape = front_flattened[front_flattened != 0].shape[0] # number of pixels of the front
-        #print(front_shape)
-
-        # compute back
-        back_mask = np.where(mask == 1, 0, 1) # jsut flip the original mask to detect the front
-        back = image * back_mask[:,:, np.newaxis].astype(np.uint8)
-        back_flattened = back.flatten()
-        back_shape = back_flattened[back_flattened != 0].shape[0] # number of pixels of the back
-        #print(back_shape)
-
-        # edges front and back
-        edges_front = cv.Canny(front, front.shape[0], front.shape[1])
-        edges_back = cv.Canny(back, back.shape[0], back.shape[1])
-
-        return np.abs((np.sum(edges_front) / front_shape) - (np.sum(edges_back) / back_shape))
-
-
-    def segment_colorfulness(self, path):
-        # split the image into its respective RGB components, then mask
-        # each of the individual RGB channels so we can compute
-        # statistics only for the masked region
-        """
-
-        """
-
-        # input
-        image = image = np.array(self._load_image(path))
-        mask = self._grabcut(path)
-
-        (B, G, R) = cv.split(image.astype("float"))
-        R = np.ma.masked_array(R, mask=mask)
-        G = np.ma.masked_array(G, mask=mask)
-        B = np.ma.masked_array(B, mask=mask)
-        # compute rg = R - G
-        rg = np.absolute(R - G)
-        # compute yb = 0.5 * (R + G) - B
-        yb = np.absolute(0.5 * (R + G) - B)
-        # compute the mean and standard deviation of both `rg` and `yb`,
-        # then combine them
-        stdRoot = np.sqrt((rg.std() ** 2) + (yb.std() ** 2))
-        meanRoot = np.sqrt((rg.mean() ** 2) + (yb.mean() ** 2))
-        # derive the "colorfulness" metric and return it
-        return stdRoot + (0.3 * meanRoot)
-
-
-# model 
-class NimaMobileNet(tf.keras.Model):
-    def __init__(self, training = True):
-
-        super(NimaMobileNet, self).__init__()
-        self.training = training
-        
-        # Ensure deterministic initialization
-        tf.random.set_seed(42)
-        
-        self.base_model = MobileNet((None, None, 3), alpha=1, include_top=False,
-            pooling='avg', weights=None)
-        
-        # Use explicit kernel initializers for deterministic behavior
-        self.dense1 = Dense(10, activation='relu', 
-                           kernel_initializer=tf.keras.initializers.GlorotUniform(seed=42),
-                           bias_initializer='zeros')
-        self.dense2 = Dense(2,
-                           kernel_initializer=tf.keras.initializers.GlorotUniform(seed=43),
-                           bias_initializer='zeros')
-
-    def call(self, x):
-        x = self.base_model(x)
-        x = self.dense1(x)
-        return self.dense2(x)
-
-
+# Example usage and training script
 if __name__ == '__main__':
-    print('import ok')
-    #print(Path(__file__).parent.resolve()/'/weights/trained_weights.h5')
-    aes = FoodAesthetics()
-    print('class inited')
-    img = './images/image2.jpeg'
-    print(aes.aesthetic_score(img))
-    #print(aes.brightness(img))
-    #print(aes.saturation(img))
-    #print(aes.contrast(img))
-    #print(aes.clarity(img))
-    #print(aes.warm(img))
-    #print(aes.colourfulness(img))
-    #print(aes.size_difference(img))
-    #print(aes.color_difference(img))
-    #print(aes.texture_difference(img))
-    #print(aes.segment_colorfulness(img))
+    print("Food Aesthetics Model Training Example")
+    print("=" * 40)
+    
+    # Initialize trainer
+    trainer = FoodAestheticsTrainer()
+    
+    # Train model (adjust parameters as needed)
+    print("Training model on labeled images...")
+    trainer.train_model(
+        images_dir='../images/',  # Path to your labeled images
+        epochs=50,                # Number of training epochs
+        validation_split=0.2,     # 20% for validation
+        batch_size=16,            # Batch size (reduce if memory issues)
+        use_augmentation=True     # Use data augmentation
+    )
+    
+    # Plot training history
+    trainer.plot_training_history()
+    
+    # Save the model
+    trainer.save_model('food_aesthetics_model.h5')
+    
+    # Test the trained model
+    print("\nTesting trained model...")
+    fa = FoodAesthetics('food_aesthetics_model.h5')
+    
+    # Test on a sample image
+    sample_image = '../images/good-1.jpeg'
+    if os.path.exists(sample_image):
+        score = fa.aesthetic_score(sample_image)
+        print(f"Aesthetic score for {sample_image}: {score:.3f}")
